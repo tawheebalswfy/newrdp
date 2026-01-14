@@ -9,27 +9,22 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      # مهم: هذا يخلي ملفات الريبو (ومنها MQL4.zip و MQL5.zip) موجودة على الجهاز
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
-          # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name "fDenyTSConnections" -Value 0 -Force
 
-          # (Optional) Disable NLA for easier testing
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "SecurityLayer" -Value 0 -Force
 
-          # Firewall rule for RDP
           netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
@@ -37,36 +32,42 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
+          $upper=[char[]](65..90)
+          $lower=[char[]](97..122)
+          $num=[char[]](48..57)
+          $spec=([char[]](33..47)+[char[]](58..64)+[char[]](91..96)+[char[]](123..126))
 
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $pw = -join( @(
+            $upper | Get-Random -Count 4
+            $lower | Get-Random -Count 4
+            $num   | Get-Random -Count 4
+            $spec  | Get-Random -Count 4
+          ) | Sort-Object {Get-Random} )
 
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $secure = ConvertTo-SecureString $pw -AsPlainText -Force
 
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires | Out-Null
+            New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires | Out-Null
           } else {
-            Set-LocalUser -Name "RDP" -Password $securePass
+            Set-LocalUser -Name "RDP" -Password $secure
           }
 
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
 
           echo "RDP_USER=RDP" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$pw"  >> $env:GITHUB_ENV
 
-      - name: Install MetaTrader 4 & 5
+      - name: Verify ZIP files exist in repo (important)
+        shell: powershell
+        run: |
+          Write-Host "Repo root content:"
+          Get-ChildItem -Force
+
+          if (-not (Test-Path ".\MQL4.zip")) { Write-Error "MQL4.zip not found in repo root"; exit 1 }
+          if (-not (Test-Path ".\MQL5.zip")) { Write-Error "MQL5.zip not found in repo root"; exit 1 }
+
+      - name: Install MT4 & MT5 to fixed folders
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -74,136 +75,149 @@ jobs:
           $mt4Url = "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt4/mt4setup.exe"
           $mt5Url = "https://download.mql5.com/cdn/web/metaquotes.ltd/mt5/mt5setup.exe"
 
-          $dlDir = "C:\Installers"
-          New-Item -ItemType Directory -Force $dlDir | Out-Null
+          $dl = "C:\Installers"
+          New-Item -ItemType Directory -Force $dl | Out-Null
 
-          $mt4Exe = Join-Path $dlDir "mt4setup.exe"
-          $mt5Exe = Join-Path $dlDir "mt5setup.exe"
+          $mt4Exe = Join-Path $dl "mt4setup.exe"
+          $mt5Exe = Join-Path $dl "mt5setup.exe"
 
           Invoke-WebRequest -Uri $mt4Url -OutFile $mt4Exe -UseBasicParsing
           Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Exe -UseBasicParsing
 
-          $mt4Path = "C:\Trading\MT4"
-          $mt5Path = "C:\Trading\MT5"
-          New-Item -ItemType Directory -Force $mt4Path, $mt5Path | Out-Null
+          $mt4Dir = "C:\MT4"
+          $mt5Dir = "C:\MT5"
+          New-Item -ItemType Directory -Force $mt4Dir, $mt5Dir | Out-Null
 
-          # MT5 supports unattended install
-          Start-Process -FilePath $mt5Exe -ArgumentList "/auto","/path:`"$mt5Path`"" -Wait
+          # MT5 unattended
+          $p5 = Start-Process -FilePath $mt5Exe -ArgumentList "/auto","/path:`"$mt5Dir`"" -Wait -PassThru
+          Write-Host "MT5 exit code: $($p5.ExitCode)"
 
-          # MT4: try unattended install; if it fails, you can install manually later from C:\Installers
+          # MT4 try unattended (قد يفشل أحيانًا)
           try {
-            Start-Process -FilePath $mt4Exe -ArgumentList "/auto","/path:`"$mt4Path`"" -Wait
+            $p4 = Start-Process -FilePath $mt4Exe -ArgumentList "/auto","/path:`"$mt4Dir`"" -Wait -PassThru
+            Write-Host "MT4 exit code: $($p4.ExitCode)"
           } catch {
-            Write-Warning "MT4 unattended install may have failed. You can run C:\Installers\mt4setup.exe manually via RDP."
+            Write-Warning "MT4 unattended install failed. You can install manually later: C:\Installers\mt4setup.exe"
           }
 
-      - name: Restore MQL4.zip & MQL5.zip into MetaTrader folders
+          # Locate executables
+          $mt5Term = Get-ChildItem -Path $mt5Dir -Recurse -Filter "terminal64.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $mt5Term) { Write-Error "MT5 terminal64.exe not found under C:\MT5"; exit 1 }
+          echo "MT5_TERMINAL=$($mt5Term.FullName)" >> $env:GITHUB_ENV
+
+          $mt4Term = Get-ChildItem -Path $mt4Dir -Recurse -Filter "terminal.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($mt4Term) {
+            echo "MT4_TERMINAL=$($mt4Term.FullName)" >> $env:GITHUB_ENV
+          } else {
+            Write-Warning "MT4 terminal.exe not found under C:\MT4 (maybe MT4 install failed)."
+          }
+
+      - name: Initialize MT4/MT5 in PORTABLE mode (creates MQL folders in install dir)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          # MT5 portable init
+          if (Test-Path $env:MT5_TERMINAL) {
+            Start-Process -FilePath $env:MT5_TERMINAL -ArgumentList "/portable" -WindowStyle Hidden
+            Start-Sleep -Seconds 12
+            Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+          # MT4 portable init (if installed)
+          if ($env:MT4_TERMINAL -and (Test-Path $env:MT4_TERMINAL)) {
+            Start-Process -FilePath $env:MT4_TERMINAL -ArgumentList "/portable" -WindowStyle Hidden
+            Start-Sleep -Seconds 12
+            Get-Process terminal -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Extract and copy MQL4.zip & MQL5.zip to PORTABLE folders
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          function Expand-ZipToTarget {
+          function Extract-MQLZip {
             param(
-              [Parameter(Mandatory=$true)][string]$ZipPath,
-              [Parameter(Mandatory=$true)][string]$TargetDir
+              [string]$ZipPath,
+              [string]$TargetMqlDir,
+              [string]$Label
             )
 
-            if (-not (Test-Path $ZipPath)) {
-              Write-Host "Zip not found: $ZipPath (skipping)"
-              return
-            }
+            New-Item -ItemType Directory -Force $TargetMqlDir | Out-Null
 
-            New-Item -ItemType Directory -Force $TargetDir | Out-Null
-
-            $tmp = Join-Path $env:TEMP ("zip_" + [Guid]::NewGuid().ToString("N"))
+            $tmp = Join-Path $env:TEMP ("mql_" + [Guid]::NewGuid().ToString("N"))
             New-Item -ItemType Directory -Force $tmp | Out-Null
 
-            Write-Host "Extracting $ZipPath -> $tmp"
+            Write-Host "[$Label] Expand: $ZipPath -> $tmp"
             Expand-Archive -Path $ZipPath -DestinationPath $tmp -Force
 
-            # Detect common structures
-            $candidate1 = Join-Path $tmp "MQL4"
-            $candidate2 = Join-Path $tmp "MQL5"
+            $mql4 = Join-Path $tmp "MQL4"
+            $mql5 = Join-Path $tmp "MQL5"
 
-            if (Test-Path $candidate1) {
-              Write-Host "Detected folder MQL4 inside zip. Copying its contents to $TargetDir"
-              Copy-Item (Join-Path $candidate1 "*") -Destination $TargetDir -Recurse -Force
-            }
-            elseif (Test-Path $candidate2) {
-              Write-Host "Detected folder MQL5 inside zip. Copying its contents to $TargetDir"
-              Copy-Item (Join-Path $candidate2 "*") -Destination $TargetDir -Recurse -Force
-            }
-            else {
-              # If zip contains Experts/Indicators/... directly
-              Write-Host "No MQL4/MQL5 top folder detected. Copying extracted contents to $TargetDir"
-              Copy-Item (Join-Path $tmp "*") -Destination $TargetDir -Recurse -Force
+            if (Test-Path $mql4) {
+              Copy-Item (Join-Path $mql4 "*") -Destination $TargetMqlDir -Recurse -Force
+            } elseif (Test-Path $mql5) {
+              Copy-Item (Join-Path $mql5 "*") -Destination $TargetMqlDir -Recurse -Force
+            } else {
+              Copy-Item (Join-Path $tmp "*") -Destination $TargetMqlDir -Recurse -Force
             }
 
             Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+
+            Write-Host "[$Label] Done. Listing target:"
+            Get-ChildItem -Path $TargetMqlDir -Force | Select-Object Name
           }
 
-          # MT4 target: ...\MQL4
-          $mt4MqlDir = "C:\Trading\MT4\MQL4"
-          # MT5 target: ...\MQL5
-          $mt5MqlDir = "C:\Trading\MT5\MQL5"
+          # For portable mode, MQL folders are inside install directory
+          $mt5Root = Split-Path $env:MT5_TERMINAL -Parent
+          $mt5Mql  = Join-Path $mt5Root "MQL5"
+          Extract-MQLZip -ZipPath ".\MQL5.zip" -TargetMqlDir $mt5Mql -Label "MT5"
 
-          Expand-ZipToTarget -ZipPath ".\MQL4.zip" -TargetDir $mt4MqlDir
-          Expand-ZipToTarget -ZipPath ".\MQL5.zip" -TargetDir $mt5MqlDir
-
-          Write-Host "MQL folders restored."
-          Write-Host "MT4 MQL4: $mt4MqlDir"
-          Write-Host "MT5 MQL5: $mt5MqlDir"
+          if ($env:MT4_TERMINAL -and (Test-Path $env:MT4_TERMINAL)) {
+            $mt4Root = Split-Path $env:MT4_TERMINAL -Parent
+            $mt4Mql  = Join-Path $mt4Root "MQL4"
+            Extract-MQLZip -ZipPath ".\MQL4.zip" -TargetMqlDir $mt4Mql -Label "MT4"
+          } else {
+            Write-Warning "MT4 not installed, so MQL4.zip was not copied."
+          }
 
       - name: Install Tailscale
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $msi -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
+          Remove-Item $msi -Force
 
       - name: Establish Tailscale Connection
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (-not "${{ secrets.TAILSCALE_AUTH_KEY }}") {
-            Write-Error "Missing secret: TAILSCALE_AUTH_KEY"
-            exit 1
-          }
+          if (-not "${{ secrets.TAILSCALE_AUTH_KEY }}") { Write-Error "Missing TAILSCALE_AUTH_KEY secret"; exit 1 }
 
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
 
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 30) {
-            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          $ip=$null; $i=0
+          while (-not $ip -and $i -lt 30) {
+            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
             Start-Sleep -Seconds 2
-            $retries++
+            $i++
           }
+          if (-not $ip) { Write-Error "No Tailscale IP"; exit 1 }
 
-          if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned."
-            exit 1
-          }
-
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $tsIP"
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $ip"
 
       - name: Verify RDP Accessibility
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-            Write-Error "TCP connection to RDP port 3389 failed"
-            exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $r.TcpTestSucceeded) { Write-Error "RDP port test failed"; exit 1 }
+          Write-Host "RDP port OK."
 
       - name: Maintain Connection
         shell: powershell
