@@ -3,196 +3,189 @@ name: RDP
 on:
   workflow_dispatch:
 
-permissions:
-  actions: write
-  contents: read
-
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 360  # خله ضمن حدود GitHub (عادة 6 ساعات كحد أقصى)
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (use uploaded files only)
         uses: actions/checkout@v4
 
-      - name: Restore latest backup (if exists)
-        shell: powershell
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $repo = $env:GITHUB_REPOSITORY
-          $headers = @{
-            Authorization = "token $env:GH_PAT"
-            "User-Agent"  = "gh-actions"
-            Accept        = "application/vnd.github+json"
-          }
-
-          $runsUrl = "https://api.github.com/repos/$repo/actions/runs?per_page=20"
-          $runs = Invoke-RestMethod -Uri $runsUrl -Headers $headers -Method Get
-
-          $artifact = $null
-          foreach ($run in $runs.workflow_runs) {
-            if ($run.conclusion -ne "success") { continue }
-            $artUrl = "https://api.github.com/repos/$repo/actions/runs/$($run.id)/artifacts"
-            $arts = Invoke-RestMethod -Uri $artUrl -Headers $headers -Method Get
-            $artifact = $arts.artifacts | Where-Object { $_.name -eq "persist-backup" } | Select-Object -First 1
-            if ($artifact) { break }
-          }
-
-          if (-not $artifact) {
-            Write-Host "No previous backup found. Skipping restore."
-            exit 0
-          }
-
-          $zipPath = "$env:TEMP\persist-backup.zip"
-          Invoke-WebRequest -Uri $artifact.archive_download_url -Headers $headers -OutFile $zipPath -UseBasicParsing
-
-          $extractPath = "$env:TEMP\persist_extract"
-          if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
-          New-Item -ItemType Directory -Force $extractPath | Out-Null
-
-          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-
-          $src = Join-Path $extractPath "persist"
-          if (-not (Test-Path $src)) { $src = $extractPath }
-
-          function Restore-Folder($from, $to) {
-            if (Test-Path $from) {
-              New-Item -ItemType Directory -Force $to | Out-Null
-              Copy-Item $from\* -Destination $to -Recurse -Force -ErrorAction SilentlyContinue
-            }
-          }
-
-          Restore-Folder (Join-Path $src "C__Installers") "C:\Installers"
-          Restore-Folder (Join-Path $src "C__MT4") "C:\MT4"
-          Restore-Folder (Join-Path $src "C__MT5") "C:\MT5"
-          Restore-Folder (Join-Path $src "C__Users__runneradmin__AppData__Roaming__MetaQuotes") "C:\Users\runneradmin\AppData\Roaming\MetaQuotes"
-
-      - name: Prepare installers (repo files only)
+      - name: Prepare Installers folder + copy uploaded files
         shell: powershell
         run: |
-          $ErrorActionPreference = "Continue"
-          $dst = "C:\Installers"
-          New-Item -ItemType Directory -Force $dst | Out-Null
+          $ErrorActionPreference = "Stop"
+          $dl = "C:\Installers"
+          New-Item -ItemType Directory -Force $dl | Out-Null
 
-          $files = @("MQL4.zip","MQL5.zip","mt4setup.exe","mt5setup.exe")
+          Write-Host "Repo workspace: $env:GITHUB_WORKSPACE"
+          $files = @("MQL4.zip","MQL5.zip","mt4setup.exe")
           foreach ($f in $files) {
             $src = Join-Path $env:GITHUB_WORKSPACE $f
             if (Test-Path $src) {
-              Copy-Item $src -Destination $dst -Force
+              Copy-Item $src -Destination $dl -Force
+              Write-Host "Copied: $f -> $dl"
+            } else {
+              Write-Host "Not found in repo: $f"
             }
           }
 
-      - name: Enable RDP
+          Write-Host "Contents of C:\Installers"
+          Get-ChildItem $dl -Force
+
+      - name: (Optional) Install MT4 from uploaded mt4setup.exe
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP" | Out-Null
-          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service TermService -Force
-
-      - name: Create RDP user
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          $pass = -join ((33..126) | Get-Random -Count 20 | % {[char]$_})
-          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
-
-          if (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue) {
-            Set-LocalUser RDP -Password $sec
+          $exe = "C:\Installers\mt4setup.exe"
+          if (Test-Path $exe) {
+            New-Item -ItemType Directory -Force "C:\MT4" | Out-Null
+            Write-Host "Installing MT4 silently..."
+            # بعض نسخ MT4 تقبل /silent أو /auto (قد تختلف حسب البيلد)
+            $p = Start-Process -FilePath $exe -ArgumentList "/silent" -Wait -PassThru
+            Write-Host "MT4 installer exit code: $($p.ExitCode)"
           } else {
-            New-LocalUser RDP -Password $sec -AccountNeverExpires
+            Write-Host "mt4setup.exe not found, skipping MT4 install."
           }
 
-          Add-LocalGroupMember Administrators RDP -ErrorAction SilentlyContinue
-          Add-LocalGroupMember "Remote Desktop Users" RDP -ErrorAction SilentlyContinue
-
-          "RDP_USER=RDP" >> $env:GITHUB_ENV
-          "RDP_PASS=$pass" >> $env:GITHUB_ENV
-
-      - name: Install Tailscale
+      - name: Configure Core RDP Settings
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $msi="$env:TEMP\tailscale.msi"
-          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi -OutFile $msi -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
 
-      - name: Start Tailscale
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Optional: Disable NLA (sometimes helps)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          # Firewall rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-$env:GITHUB_RUN_ID
 
-          $ip=""
-          for($i=0;$i -lt 12;$i++){
-            $ip=& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-            if($ip){break}
-            Start-Sleep 5
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
-          if(!$ip){exit 1}
-          "TS_IP=$ip" >> $env:GITHUB_ENV
 
-      - name: Show RDP info
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # لو المستخدم موجود لا تفشل
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Write-Host "User RDP already exists, resetting password..."
+            Set-LocalUser -Name "RDP" -Password $securePass
+          } else {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          "RDP_USER=RDP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install Tailscale (with retry)
         shell: powershell
         run: |
-          Write-Host "RDP IP : $env:TS_IP"
-          Write-Host "USER   : $env:RDP_USER"
-          Write-Host "PASS   : $env:RDP_PASS"
+          $ErrorActionPreference = "Stop"
 
-      - name: Persist data (MT4/MT5 + data)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-          $p="$env:GITHUB_WORKSPACE\persist"
-          New-Item -ItemType Directory -Force $p | Out-Null
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
 
-          function Save-Folder($path) {
-            if (Test-Path $path) {
-              $name = ($path -replace "[:\\]","_")
-              $dest = Join-Path $p $name
-              New-Item -ItemType Directory -Force $dest | Out-Null
-              Copy-Item $path\* -Destination $dest -Recurse -Force -ErrorAction SilentlyContinue
+          $ok = $false
+          for ($i=1; $i -le 5; $i++) {
+            try {
+              Write-Host "Downloading Tailscale (try $i/5)..."
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+              $ok = $true
+              break
+            } catch {
+              Write-Host "Download failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds (5 * $i)
             }
           }
+          if (-not $ok) { throw "Failed to download Tailscale after retries." }
 
-          Save-Folder "C:\Installers"
-          Save-Folder "C:\MT4"
-          Save-Folder "C:\MT5"
-          Save-Folder "C:\Users\runneradmin\AppData\Roaming\MetaQuotes"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
-      - name: Upload backup artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: persist-backup
-          path: persist
-          retention-days: 7
-
-      - name: Keep alive & auto-restart
+      - name: Establish Tailscale Connection (with retry)
         shell: powershell
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          $ok = $false
+          for ($i=1; $i -le 5; $i++) {
+            try {
+              Write-Host "Tailscale up (try $i/5)..."
+              & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+              $ok = $true
+              break
+            } catch {
+              Write-Host "tailscale up failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds (5 * $i)
+            }
+          }
+          if (-not $ok) { throw "Failed to bring up Tailscale after retries." }
+
+          # Wait for IP
+          $tsIP = $null
+          for ($r=1; $r -le 12; $r++) {
+            $tsIP = (& $ts ip -4) 2>$null
+            if ($tsIP) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $tsIP) { throw "Tailscale IP not assigned." }
+
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Show RDP Info
+        shell: powershell
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "Uploaded files are in: C:\Installers"
+          Write-Host "===================`n"
+
+      - name: Keep session alive (until job limit)
+        shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          $start=Get-Date
-
-          while($true){
-            $m=((Get-Date)-$start).TotalMinutes
-            if($m -ge 315){
-              $repo=$env:GITHUB_REPOSITORY
-              $url="https://api.github.com/repos/$repo/actions/workflows/main.yml/dispatches"
-              $body=@{ref=$env:GITHUB_REF_NAME}|ConvertTo-Json
-              Invoke-RestMethod -Method Post -Uri $url `
-                -Headers @{Authorization="token $env:GH_PAT"; "User-Agent"="gh-actions"; Accept="application/vnd.github+json"} `
-                -Body $body
+          $start = Get-Date
+          $maxMinutes = 330  # خليها أقل من الحد الأقصى (احتياط)
+          while ($true) {
+            $elapsed = (Get-Date) - $start
+            Write-Host "[$(Get-Date)] Runner alive. Elapsed: $([int]$elapsed.TotalMinutes)m"
+            Restart-Service -Name TermService -ErrorAction SilentlyContinue | Out-Null
+            Start-Sleep -Seconds 300
+            if ($elapsed.TotalMinutes -ge $maxMinutes) {
+              Write-Host "Reached safe keepalive limit. Exiting."
               break
             }
-            Start-Sleep 300
           }
