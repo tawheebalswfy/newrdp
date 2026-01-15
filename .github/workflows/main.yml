@@ -6,186 +6,108 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360  # خله ضمن حدود GitHub (عادة 6 ساعات كحد أقصى)
+    timeout-minutes: 3600
 
     steps:
-      - name: Checkout repository (use uploaded files only)
-        uses: actions/checkout@v4
-
-      - name: Prepare Installers folder + copy uploaded files
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          $dl = "C:\Installers"
-          New-Item -ItemType Directory -Force $dl | Out-Null
-
-          Write-Host "Repo workspace: $env:GITHUB_WORKSPACE"
-          $files = @("MQL4.zip","MQL5.zip","mt4setup.exe")
-          foreach ($f in $files) {
-            $src = Join-Path $env:GITHUB_WORKSPACE $f
-            if (Test-Path $src) {
-              Copy-Item $src -Destination $dl -Force
-              Write-Host "Copied: $f -> $dl"
-            } else {
-              Write-Host "Not found in repo: $f"
-            }
-          }
-
-          Write-Host "Contents of C:\Installers"
-          Get-ChildItem $dl -Force
-
-      - name: (Optional) Install MT4 from uploaded mt4setup.exe
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          $exe = "C:\Installers\mt4setup.exe"
-          if (Test-Path $exe) {
-            New-Item -ItemType Directory -Force "C:\MT4" | Out-Null
-            Write-Host "Installing MT4 silently..."
-            # بعض نسخ MT4 تقبل /silent أو /auto (قد تختلف حسب البيلد)
-            $p = Start-Process -FilePath $exe -ArgumentList "/silent" -Wait -PassThru
-            Write-Host "MT4 installer exit code: $($p.ExitCode)"
-          } else {
-            Write-Host "mt4setup.exe not found, skipping MT4 install."
-          }
-
       - name: Configure Core RDP Settings
-        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-
-          # Enable Remote Desktop
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
-
-          # Optional: Disable NLA (sometimes helps)
+                             -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
+                             -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          # Firewall rule
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
-        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
           }
-
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
           $rawPassword += $charSet.Lower | Get-Random -Count 4
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
-
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-          # لو المستخدم موجود لا تفشل
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            Write-Host "User RDP already exists, resetting password..."
-            Set-LocalUser -Name "RDP" -Password $securePass
-          } else {
-            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
           }
 
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-
-          "RDP_USER=RDP" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Install Tailscale (with retry)
-        shell: powershell
+      - name: Install Tailscale
         run: |
-          $ErrorActionPreference = "Stop"
-
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-
-          $ok = $false
-          for ($i=1; $i -le 5; $i++) {
-            try {
-              Write-Host "Downloading Tailscale (try $i/5)..."
-              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-              $ok = $true
-              break
-            } catch {
-              Write-Host "Download failed: $($_.Exception.Message)"
-              Start-Sleep -Seconds (5 * $i)
-            }
-          }
-          if (-not $ok) { throw "Failed to download Tailscale after retries." }
-
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection (with retry)
-        shell: powershell
+      - name: Establish Tailscale Connection
         run: |
-          $ErrorActionPreference = "Stop"
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          $ok = $false
-          for ($i=1; $i -le 5; $i++) {
-            try {
-              Write-Host "Tailscale up (try $i/5)..."
-              & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-              $ok = $true
-              break
-            } catch {
-              Write-Host "tailscale up failed: $($_.Exception.Message)"
-              Start-Sleep -Seconds (5 * $i)
-            }
-          }
-          if (-not $ok) { throw "Failed to bring up Tailscale after retries." }
-
-          # Wait for IP
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
           $tsIP = $null
-          for ($r=1; $r -le 12; $r++) {
-            $tsIP = (& $ts ip -4) 2>$null
-            if ($tsIP) { break }
-            Start-Sleep -Seconds 5
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-          if (-not $tsIP) { throw "Tailscale IP not assigned." }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "Tailscale IP: $tsIP"
-
-      - name: Show RDP Info
-        shell: powershell
+      - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address : $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: $env:RDP_PASS"
-          Write-Host "Uploaded files are in: C:\Installers"
-          Write-Host "===================`n"
-
-      - name: Keep session alive (until job limit)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-          $start = Get-Date
-          $maxMinutes = 330  # خليها أقل من الحد الأقصى (احتياط)
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-            $elapsed = (Get-Date) - $start
-            Write-Host "[$(Get-Date)] Runner alive. Elapsed: $([int]$elapsed.TotalMinutes)m"
-            Restart-Service -Name TermService -ErrorAction SilentlyContinue | Out-Null
-            Start-Sleep -Seconds 300
-            if ($elapsed.TotalMinutes -ge $maxMinutes) {
-              Write-Host "Reached safe keepalive limit. Exiting."
-              break
-            }
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
           }
