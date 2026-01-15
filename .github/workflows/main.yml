@@ -16,7 +16,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------- RESTORE: Download latest artifact (persist-backup) ----------
       - name: Restore latest backup (if exists)
         shell: powershell
         env:
@@ -31,7 +30,6 @@ jobs:
             Accept        = "application/vnd.github+json"
           }
 
-          Write-Host "Searching for latest successful run artifacts..."
           $runsUrl = "https://api.github.com/repos/$repo/actions/runs?per_page=20"
           $runs = Invoke-RestMethod -Uri $runsUrl -Headers $headers -Method Get
 
@@ -49,31 +47,21 @@ jobs:
             exit 0
           }
 
-          Write-Host "Found backup artifact id: $($artifact.id) from run id: $($artifact.workflow_run.id)"
-          $zipUrl = $artifact.archive_download_url
           $zipPath = "$env:TEMP\persist-backup.zip"
-          Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $zipPath -UseBasicParsing
+          Invoke-WebRequest -Uri $artifact.archive_download_url -Headers $headers -OutFile $zipPath -UseBasicParsing
 
           $extractPath = "$env:TEMP\persist_extract"
           if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
           New-Item -ItemType Directory -Force $extractPath | Out-Null
 
           Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-          Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
 
-          # Restore folders if present
           $src = Join-Path $extractPath "persist"
+          if (-not (Test-Path $src)) { $src = $extractPath }
 
-          if (-not (Test-Path $src)) {
-            # sometimes artifact root is already persist
-            $src = $extractPath
-          }
-
-          # Helper restore
           function Restore-Folder($from, $to) {
             if (Test-Path $from) {
               New-Item -ItemType Directory -Force $to | Out-Null
-              Write-Host "Restoring $from -> $to"
               Copy-Item $from\* -Destination $to -Recurse -Force -ErrorAction SilentlyContinue
             }
           }
@@ -83,9 +71,6 @@ jobs:
           Restore-Folder (Join-Path $src "C__MT5") "C:\MT5"
           Restore-Folder (Join-Path $src "C__Users__runneradmin__AppData__Roaming__MetaQuotes") "C:\Users\runneradmin\AppData\Roaming\MetaQuotes"
 
-          Write-Host "Restore completed."
-
-      # ---------- Ensure installers folder and copy repo files ----------
       - name: Prepare installers (repo files only)
         shell: powershell
         run: |
@@ -100,9 +85,7 @@ jobs:
               Copy-Item $src -Destination $dst -Force
             }
           }
-          Get-ChildItem $dst -ErrorAction SilentlyContinue
 
-      # ---------- Enable RDP ----------
       - name: Enable RDP
         shell: powershell
         run: |
@@ -113,7 +96,6 @@ jobs:
           netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
           Restart-Service TermService -Force
 
-      # ---------- Create RDP user ----------
       - name: Create RDP user
         shell: powershell
         run: |
@@ -133,7 +115,6 @@ jobs:
           "RDP_USER=RDP" >> $env:GITHUB_ENV
           "RDP_PASS=$pass" >> $env:GITHUB_ENV
 
-      # ---------- Install Tailscale ----------
       - name: Install Tailscale
         shell: powershell
         run: |
@@ -142,7 +123,6 @@ jobs:
           Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi -OutFile $msi -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
 
-      # ---------- Start Tailscale ----------
       - name: Start Tailscale
         shell: powershell
         run: |
@@ -160,17 +140,13 @@ jobs:
           if(!$ip){exit 1}
           "TS_IP=$ip" >> $env:GITHUB_ENV
 
-      # ---------- Show RDP info ----------
       - name: Show RDP info
         shell: powershell
         run: |
           Write-Host "RDP IP : $env:TS_IP"
           Write-Host "USER   : $env:RDP_USER"
           Write-Host "PASS   : $env:RDP_PASS"
-          Write-Host "MT4 dir: C:\MT4 (if restored/installed)"
-          Write-Host "MT5 dir: C:\MT5 (if restored/installed)"
 
-      # ---------- BACKUP: Save MT4/MT5 + MetaQuotes data ----------
       - name: Persist data (MT4/MT5 + data)
         shell: powershell
         run: |
@@ -183,10 +159,7 @@ jobs:
               $name = ($path -replace "[:\\]","_")
               $dest = Join-Path $p $name
               New-Item -ItemType Directory -Force $dest | Out-Null
-              Write-Host "Saving $path -> $dest"
               Copy-Item $path\* -Destination $dest -Recurse -Force -ErrorAction SilentlyContinue
-            } else {
-              Write-Host "Skip (not found): $path"
             }
           }
 
@@ -202,7 +175,6 @@ jobs:
           path: persist
           retention-days: 7
 
-      # ---------- Keep alive + auto-restart ----------
       - name: Keep alive & auto-restart
         shell: powershell
         env:
@@ -213,9 +185,7 @@ jobs:
 
           while($true){
             $m=((Get-Date)-$start).TotalMinutes
-
             if($m -ge 315){
-              Write-Host "Dispatching a new run..."
               $repo=$env:GITHUB_REPOSITORY
               $url="https://api.github.com/repos/$repo/actions/workflows/main.yml/dispatches"
               $body=@{ref=$env:GITHUB_REF_NAME}|ConvertTo-Json
@@ -224,6 +194,5 @@ jobs:
                 -Body $body
               break
             }
-
-            Start-Sleep 345
+            Start-Sleep 300
           }
