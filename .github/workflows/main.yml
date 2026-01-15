@@ -3,288 +3,131 @@ name: RDP
 on:
   workflow_dispatch:
 
+permissions:
+  actions: write
+  contents: write
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
+      # 1) تحميل ملفات الريبو فقط
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure Core RDP Settings
-        shell: powershell
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
-
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
-
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
+      # 2) نسخ الملفات المرفوعة إلى C:\Installers
+      - name: Prepare installers (repo files only)
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          $dst = "C:\Installers"
+          New-Item -ItemType Directory -Force $dst | Out-Null
 
-          $upper=[char[]](65..90)
-          $lower=[char[]](97..122)
-          $num=[char[]](48..57)
-          $spec=([char[]](33..47)+[char[]](58..64)+[char[]](91..96)+[char[]](123..126))
-
-          $pw = -join( @(
-            $upper | Get-Random -Count 4
-            $lower | Get-Random -Count 4
-            $num   | Get-Random -Count 4
-            $spec  | Get-Random -Count 4
-          ) | Sort-Object {Get-Random} )
-
-          $secure = ConvertTo-SecureString $pw -AsPlainText -Force
-
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires | Out-Null
-          } else {
-            Set-LocalUser -Name "RDP" -Password $secure
-          }
-
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-
-          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$pw"  >> $env:GITHUB_ENV
-
-      - name: Verify required files exist in repo
-        shell: powershell
-        run: |
-          Write-Host "Repo root content:"
-          Get-ChildItem -Force
-
-          if (-not (Test-Path ".\MQL4.zip")) { Write-Error "MQL4.zip not found in repo root"; exit 1 }
-          if (-not (Test-Path ".\MQL5.zip")) { Write-Error "MQL5.zip not found in repo root"; exit 1 }
-          if (-not (Test-Path ".\mt4setup.exe")) { Write-Error "mt4setup.exe not found in repo root"; exit 1 }
-
-      - name: Install MT5 (winget) + MT4 (from repo) with timeouts
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $dl = "C:\Installers"
-          New-Item -ItemType Directory -Force $dl | Out-Null
-
-          # -------------------------
-          # MT5 via winget (more reliable)
-          # -------------------------
-          Write-Host "Installing MT5 via winget..."
-          try {
-            winget source update | Out-Null
-            winget install --id MetaQuotes.MetaTrader5 -e --accept-source-agreements --accept-package-agreements
-            Write-Host "MT5 winget install finished."
-          } catch {
-            Write-Warning "MT5 winget install failed: $($_.Exception.Message)"
-          }
-
-          # Find MT5 terminal64.exe
-          $mt5Candidates = @(
-            "C:\Program Files\MetaTrader 5",
-            "C:\Program Files (x86)\MetaTrader 5",
-            "$env:LOCALAPPDATA\Programs\MetaTrader 5",
-            "$env:APPDATA\MetaQuotes\Terminal"
-          )
-
-          $mt5Term = $null
-          foreach ($c in $mt5Candidates) {
-            if (Test-Path $c) {
-              $found = Get-ChildItem -Path $c -Recurse -Filter "terminal64.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($found) { $mt5Term = $found; break }
+          $files = @("MQL4.zip","MQL5.zip","mt4setup.exe")
+          foreach ($f in $files) {
+            $src = Join-Path $env:GITHUB_WORKSPACE $f
+            if (Test-Path $src) {
+              Copy-Item $src -Destination $dst -Force
             }
           }
+          Get-ChildItem $dst
 
-          if (-not $mt5Term) {
-            Write-Host "MT5 not found via winget. Will download installer and start interactive mode in RDP."
-
-            $mt5Url = "https://download.mql5.com/cdn/web/metaquotes.ltd/mt5/mt5setup.exe"
-            $mt5Exe = Join-Path $dl "mt5setup.exe"
-            Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Exe -UseBasicParsing
-
-            Start-Process -FilePath $mt5Exe
-            Write-Warning "MT5 installer started interactively. Finish it inside RDP."
-          } else {
-            echo "MT5_TERMINAL=$($mt5Term.FullName)" >> $env:GITHUB_ENV
-            Write-Host "MT5 terminal: $($mt5Term.FullName)"
-          }
-
-          # -------------------------
-          # MT4 from repo (mt4setup.exe) with timeout
-          # -------------------------
-          $mt4Exe = Join-Path $dl "mt4setup.exe"
-          Copy-Item ".\mt4setup.exe" $mt4Exe -Force
-          Write-Host "Installing MT4 from repo (mt4setup.exe)..."
-
-          $p4 = Start-Process -FilePath $mt4Exe -ArgumentList "/silent","/verysilent","/sp-","/suppressmsgboxes" -PassThru
-          $timeoutSec = 180  # 3 minutes
-          if (-not $p4.WaitForExit($timeoutSec * 1000)) {
-            Write-Warning "MT4 silent install timed out. Starting interactive installer for RDP..."
-            try { $p4.Kill() } catch {}
-            Start-Process -FilePath $mt4Exe
-            Write-Warning "MT4 installer started interactively. Finish it inside RDP."
-          } else {
-            Write-Host "MT4 exit code: $($p4.ExitCode)"
-          }
-
-          # Find MT4 terminal.exe
-          $mt4Candidates = @(
-            "C:\MT4",
-            "C:\Program Files\MetaTrader 4",
-            "C:\Program Files (x86)\MetaTrader 4",
-            "$env:LOCALAPPDATA\Programs\MetaTrader 4",
-            "$env:APPDATA\MetaQuotes\Terminal",
-            "C:\Program Files\",
-            "C:\Program Files (x86)\"
-          )
-
-          $mt4Term = $null
-          foreach ($c in $mt4Candidates) {
-            if (Test-Path $c) {
-              $found = Get-ChildItem -Path $c -Recurse -Filter "terminal.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($found) { $mt4Term = $found; break }
-            }
-          }
-
-          if ($mt4Term) {
-            echo "MT4_TERMINAL=$($mt4Term.FullName)" >> $env:GITHUB_ENV
-            Write-Host "MT4 terminal: $($mt4Term.FullName)"
-          } else {
-            Write-Warning "MT4 terminal not found yet. If installer is open, finish it inside RDP."
-          }
-
-      - name: Initialize MT4/MT5 in PORTABLE mode (creates MQL folders in install dir)
+      # 3) تفعيل RDP
+      - name: Enable RDP
         shell: powershell
         run: |
-          $ErrorActionPreference = "Continue"
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service TermService -Force
 
-          if ($env:MT5_TERMINAL -and (Test-Path $env:MT5_TERMINAL)) {
-            Start-Process -FilePath $env:MT5_TERMINAL -ArgumentList "/portable" -WindowStyle Hidden
-            Start-Sleep -Seconds 12
-            Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          } else {
-            Write-Warning "Skipping MT5 portable init (MT5 terminal not detected)."
-          }
-
-          if ($env:MT4_TERMINAL -and (Test-Path $env:MT4_TERMINAL)) {
-            Start-Process -FilePath $env:MT4_TERMINAL -ArgumentList "/portable" -WindowStyle Hidden
-            Start-Sleep -Seconds 12
-            Get-Process terminal -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          } else {
-            Write-Warning "Skipping MT4 portable init (MT4 terminal not detected)."
-          }
-
-      - name: Extract and copy MQL4.zip & MQL5.zip to PORTABLE folders
+      # 4) إنشاء مستخدم RDP
+      - name: Create RDP user
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $pass = -join ((33..126) | Get-Random -Count 20 | % {[char]$_})
+          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
 
-          function Extract-MQLZip {
-            param(
-              [string]$ZipPath,
-              [string]$TargetMqlDir,
-              [string]$Label
-            )
-
-            New-Item -ItemType Directory -Force $TargetMqlDir | Out-Null
-
-            $tmp = Join-Path $env:TEMP ("mql_" + [Guid]::NewGuid().ToString("N"))
-            New-Item -ItemType Directory -Force $tmp | Out-Null
-
-            Write-Host "[$Label] Expand: $ZipPath -> $tmp"
-            Expand-Archive -Path $ZipPath -DestinationPath $tmp -Force
-
-            $mql4 = Join-Path $tmp "MQL4"
-            $mql5 = Join-Path $tmp "MQL5"
-
-            if (Test-Path $mql4) {
-              Copy-Item (Join-Path $mql4 "*") -Destination $TargetMqlDir -Recurse -Force
-            } elseif (Test-Path $mql5) {
-              Copy-Item (Join-Path $mql5 "*") -Destination $TargetMqlDir -Recurse -Force
-            } else {
-              Copy-Item (Join-Path $tmp "*") -Destination $TargetMqlDir -Recurse -Force
-            }
-
-            Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-
-            Write-Host "[$Label] Done. Listing target (top level):"
-            Get-ChildItem -Path $TargetMqlDir -Force | Select-Object Name
-          }
-
-          # MT5
-          if ($env:MT5_TERMINAL -and (Test-Path $env:MT5_TERMINAL)) {
-            $mt5Root = Split-Path $env:MT5_TERMINAL -Parent
-            $mt5Mql  = Join-Path $mt5Root "MQL5"
-            Extract-MQLZip -ZipPath ".\MQL5.zip" -TargetMqlDir $mt5Mql -Label "MT5"
+          if (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue) {
+            Set-LocalUser RDP -Password $sec
           } else {
-            Write-Warning "MT5 not detected, so MQL5.zip was not copied."
+            New-LocalUser RDP -Password $sec -AccountNeverExpires
           }
 
-          # MT4
-          if ($env:MT4_TERMINAL -and (Test-Path $env:MT4_TERMINAL)) {
-            $mt4Root = Split-Path $env:MT4_TERMINAL -Parent
-            $mt4Mql  = Join-Path $mt4Root "MQL4"
-            Extract-MQLZip -ZipPath ".\MQL4.zip" -TargetMqlDir $mt4Mql -Label "MT4"
-          } else {
-            Write-Warning "MT4 not detected, so MQL4.zip was not copied."
-          }
+          Add-LocalGroupMember Administrators RDP -ErrorAction SilentlyContinue
+          Add-LocalGroupMember "Remote Desktop Users" RDP -ErrorAction SilentlyContinue
 
+          "RDP_USER=RDP" >> $env:GITHUB_ENV
+          "RDP_PASS=$pass" >> $env:GITHUB_ENV
+
+      # 5) تثبيت Tailscale
       - name: Install Tailscale
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $msi = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $msi -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
-          Remove-Item $msi -Force
+          $msi="$env:TEMP\tailscale.msi"
+          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
 
-      - name: Establish Tailscale Connection
+      # 6) تشغيل Tailscale
+      - name: Start Tailscale
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-          if (-not "${{ secrets.TAILSCALE_AUTH_KEY }}") { Write-Error "Missing TAILSCALE_AUTH_KEY secret"; exit 1 }
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-$env:GITHUB_RUN_ID
 
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-
-          $ip=$null; $i=0
-          while (-not $ip -and $i -lt 30) {
-            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-            Start-Sleep -Seconds 2
-            $i++
+          $ip=""
+          for($i=0;$i -lt 12;$i++){
+            $ip=& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            if($ip){break}
+            Start-Sleep 5
           }
-          if (-not $ip) { Write-Error "No Tailscale IP"; exit 1 }
+          if(!$ip){exit 1}
+          "TS_IP=$ip" >> $env:GITHUB_ENV
 
-          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $ip"
-
-      - name: Verify RDP Accessibility
+      # 7) حفظ البيانات المهمة (Persist)
+      - name: Persist data
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $r.TcpTestSucceeded) { Write-Error "RDP port test failed"; exit 1 }
-          Write-Host "RDP port OK."
+          $p="$env:GITHUB_WORKSPACE\persist"
+          New-Item -ItemType Directory -Force $p | Out-Null
+          Copy-Item C:\Installers $p\Installers -Recurse -Force -ErrorAction SilentlyContinue
 
-      - name: Maintain Connection
+      # 8) رفع النسخة الاحتياطية
+      - name: Upload backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: persist-backup
+          path: persist
+          retention-days: 7
+
+      # 9) عرض معلومات الدخول
+      - name: Show RDP info
         shell: powershell
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address : $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: $env:RDP_PASS"
-          Write-Host "==================`n"
+          Write-Host "RDP IP : $env:TS_IP"
+          Write-Host "USER   : $env:RDP_USER"
+          Write-Host "PASS   : $env:RDP_PASS"
 
-          while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active"
-            Start-Sleep -Seconds 300
+      # 10) إبقاء الجلسة + إعادة تشغيل تلقائي
+      - name: Keep alive & auto-restart
+        shell: powershell
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          $start=Get-Date
+          while($true){
+            $m=((Get-Date)-$start).TotalMinutes
+            if($m -ge 315){
+              $repo=$env:GITHUB_REPOSITORY
+              $url="https://api.github.com/repos/$repo/actions/workflows/main.yml/dispatches"
+              $body=@{ref=$env:GITHUB_REF_NAME}|ConvertTo-Json
+              Invoke-RestMethod -Method Post -Uri $url `
+                -Headers @{Authorization="token $env:GH_PAT"} `
+                -Body $body
+              break
+            }
+            Start-Sleep 300
           }
