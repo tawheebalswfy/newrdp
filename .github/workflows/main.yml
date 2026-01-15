@@ -5,7 +5,7 @@ on:
 
 permissions:
   actions: write
-  contents: write
+  contents: read
 
 jobs:
   secure-rdp:
@@ -13,40 +13,111 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # 1) تحميل ملفات الريبو فقط
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2) نسخ الملفات المرفوعة إلى C:\Installers
+      # ---------- RESTORE: Download latest artifact (persist-backup) ----------
+      - name: Restore latest backup (if exists)
+        shell: powershell
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $repo = $env:GITHUB_REPOSITORY
+          $headers = @{
+            Authorization = "token $env:GH_PAT"
+            "User-Agent"  = "gh-actions"
+            Accept        = "application/vnd.github+json"
+          }
+
+          Write-Host "Searching for latest successful run artifacts..."
+          $runsUrl = "https://api.github.com/repos/$repo/actions/runs?per_page=20"
+          $runs = Invoke-RestMethod -Uri $runsUrl -Headers $headers -Method Get
+
+          $artifact = $null
+          foreach ($run in $runs.workflow_runs) {
+            if ($run.conclusion -ne "success") { continue }
+            $artUrl = "https://api.github.com/repos/$repo/actions/runs/$($run.id)/artifacts"
+            $arts = Invoke-RestMethod -Uri $artUrl -Headers $headers -Method Get
+            $artifact = $arts.artifacts | Where-Object { $_.name -eq "persist-backup" } | Select-Object -First 1
+            if ($artifact) { break }
+          }
+
+          if (-not $artifact) {
+            Write-Host "No previous backup found. Skipping restore."
+            exit 0
+          }
+
+          Write-Host "Found backup artifact id: $($artifact.id) from run id: $($artifact.workflow_run.id)"
+          $zipUrl = $artifact.archive_download_url
+          $zipPath = "$env:TEMP\persist-backup.zip"
+          Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $zipPath -UseBasicParsing
+
+          $extractPath = "$env:TEMP\persist_extract"
+          if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+          New-Item -ItemType Directory -Force $extractPath | Out-Null
+
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+          Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+
+          # Restore folders if present
+          $src = Join-Path $extractPath "persist"
+
+          if (-not (Test-Path $src)) {
+            # sometimes artifact root is already persist
+            $src = $extractPath
+          }
+
+          # Helper restore
+          function Restore-Folder($from, $to) {
+            if (Test-Path $from) {
+              New-Item -ItemType Directory -Force $to | Out-Null
+              Write-Host "Restoring $from -> $to"
+              Copy-Item $from\* -Destination $to -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          Restore-Folder (Join-Path $src "C__Installers") "C:\Installers"
+          Restore-Folder (Join-Path $src "C__MT4") "C:\MT4"
+          Restore-Folder (Join-Path $src "C__MT5") "C:\MT5"
+          Restore-Folder (Join-Path $src "C__Users__runneradmin__AppData__Roaming__MetaQuotes") "C:\Users\runneradmin\AppData\Roaming\MetaQuotes"
+
+          Write-Host "Restore completed."
+
+      # ---------- Ensure installers folder and copy repo files ----------
       - name: Prepare installers (repo files only)
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
           $dst = "C:\Installers"
           New-Item -ItemType Directory -Force $dst | Out-Null
 
-          $files = @("MQL4.zip","MQL5.zip","mt4setup.exe")
+          $files = @("MQL4.zip","MQL5.zip","mt4setup.exe","mt5setup.exe")
           foreach ($f in $files) {
             $src = Join-Path $env:GITHUB_WORKSPACE $f
             if (Test-Path $src) {
               Copy-Item $src -Destination $dst -Force
             }
           }
-          Get-ChildItem $dst
+          Get-ChildItem $dst -ErrorAction SilentlyContinue
 
-      # 3) تفعيل RDP
+      # ---------- Enable RDP ----------
       - name: Enable RDP
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
           Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name fDenyTSConnections -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP" | Out-Null
           netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
           Restart-Service TermService -Force
 
-      # 4) إنشاء مستخدم RDP
+      # ---------- Create RDP user ----------
       - name: Create RDP user
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
           $pass = -join ((33..126) | Get-Random -Count 20 | % {[char]$_})
           $sec = ConvertTo-SecureString $pass -AsPlainText -Force
 
@@ -62,18 +133,20 @@ jobs:
           "RDP_USER=RDP" >> $env:GITHUB_ENV
           "RDP_PASS=$pass" >> $env:GITHUB_ENV
 
-      # 5) تثبيت Tailscale
+      # ---------- Install Tailscale ----------
       - name: Install Tailscale
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
           $msi="$env:TEMP\tailscale.msi"
-          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi -OutFile $msi
+          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi -OutFile $msi -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
 
-      # 6) تشغيل Tailscale
+      # ---------- Start Tailscale ----------
       - name: Start Tailscale
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
             --hostname=gh-$env:GITHUB_RUN_ID
@@ -87,47 +160,70 @@ jobs:
           if(!$ip){exit 1}
           "TS_IP=$ip" >> $env:GITHUB_ENV
 
-      # 7) حفظ البيانات المهمة (Persist)
-      - name: Persist data
-        shell: powershell
-        run: |
-          $p="$env:GITHUB_WORKSPACE\persist"
-          New-Item -ItemType Directory -Force $p | Out-Null
-          Copy-Item C:\Installers $p\Installers -Recurse -Force -ErrorAction SilentlyContinue
-
-      # 8) رفع النسخة الاحتياطية
-      - name: Upload backup
-        uses: actions/upload-artifact@v4
-        with:
-          name: persist-backup
-          path: persist
-          retention-days: 7
-
-      # 9) عرض معلومات الدخول
+      # ---------- Show RDP info ----------
       - name: Show RDP info
         shell: powershell
         run: |
           Write-Host "RDP IP : $env:TS_IP"
           Write-Host "USER   : $env:RDP_USER"
           Write-Host "PASS   : $env:RDP_PASS"
+          Write-Host "MT4 dir: C:\MT4 (if restored/installed)"
+          Write-Host "MT5 dir: C:\MT5 (if restored/installed)"
 
-      # 10) إبقاء الجلسة + إعادة تشغيل تلقائي
+      # ---------- BACKUP: Save MT4/MT5 + MetaQuotes data ----------
+      - name: Persist data (MT4/MT5 + data)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $p="$env:GITHUB_WORKSPACE\persist"
+          New-Item -ItemType Directory -Force $p | Out-Null
+
+          function Save-Folder($path) {
+            if (Test-Path $path) {
+              $name = ($path -replace "[:\\]","_")
+              $dest = Join-Path $p $name
+              New-Item -ItemType Directory -Force $dest | Out-Null
+              Write-Host "Saving $path -> $dest"
+              Copy-Item $path\* -Destination $dest -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+              Write-Host "Skip (not found): $path"
+            }
+          }
+
+          Save-Folder "C:\Installers"
+          Save-Folder "C:\MT4"
+          Save-Folder "C:\MT5"
+          Save-Folder "C:\Users\runneradmin\AppData\Roaming\MetaQuotes"
+
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: persist-backup
+          path: persist
+          retention-days: 7
+
+      # ---------- Keep alive + auto-restart ----------
       - name: Keep alive & auto-restart
         shell: powershell
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
+          $ErrorActionPreference = "Continue"
           $start=Get-Date
+
           while($true){
             $m=((Get-Date)-$start).TotalMinutes
+
             if($m -ge 315){
+              Write-Host "Dispatching a new run..."
               $repo=$env:GITHUB_REPOSITORY
               $url="https://api.github.com/repos/$repo/actions/workflows/main.yml/dispatches"
               $body=@{ref=$env:GITHUB_REF_NAME}|ConvertTo-Json
               Invoke-RestMethod -Method Post -Uri $url `
-                -Headers @{Authorization="token $env:GH_PAT"} `
+                -Headers @{Authorization="token $env:GH_PAT"; "User-Agent"="gh-actions"; Accept="application/vnd.github+json"} `
                 -Body $body
               break
             }
-            Start-Sleep 300
+
+            Start-Sleep 345
           }
