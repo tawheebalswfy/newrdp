@@ -68,7 +68,7 @@ jobs:
           if (-not (Test-Path ".\MQL5.zip")) { Write-Error "MQL5.zip not found in repo root"; exit 1 }
           if (-not (Test-Path ".\mt4setup.exe")) { Write-Error "mt4setup.exe not found in repo root"; exit 1 }
 
-      - name: Install MT5 (download) + MT4 (from repo mt4setup.exe)
+      - name: Install MT5 (winget) + MT4 (from repo) with timeouts
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -76,43 +76,20 @@ jobs:
           $dl = "C:\Installers"
           New-Item -ItemType Directory -Force $dl | Out-Null
 
-          # ---- MT5 download (official) ----
-          $mt5Url = "https://download.mql5.com/cdn/web/metaquotes.ltd/mt5/mt5setup.exe"
-          $mt5Exe = Join-Path $dl "mt5setup.exe"
-          Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Exe -UseBasicParsing
-
-          $mt5Dir = "C:\MT5"
-          $mt4Dir = "C:\MT4"
-          New-Item -ItemType Directory -Force $mt5Dir, $mt4Dir | Out-Null
-
-          Write-Host "Installing MT5..."
-          $p5 = Start-Process -FilePath $mt5Exe -ArgumentList "/auto","/path:`"$mt5Dir`"" -Wait -PassThru
-          Write-Host "MT5 exit code: $($p5.ExitCode)"
-
-          # ---- MT4 from repo file ----
-          $mt4Exe = Join-Path $dl "mt4setup.exe"
-          Copy-Item ".\mt4setup.exe" $mt4Exe -Force
-          Write-Host "Installing MT4 from repo (mt4setup.exe)..."
-
-          # Try silent flags (may or may not be supported depending on your installer)
-          $mt4Installed = $false
+          # -------------------------
+          # MT5 via winget (more reliable)
+          # -------------------------
+          Write-Host "Installing MT5 via winget..."
           try {
-            $p4 = Start-Process -FilePath $mt4Exe -ArgumentList "/silent","/verysilent","/sp-","/suppressmsgboxes" -Wait -PassThru
-            Write-Host "MT4 exit code: $($p4.ExitCode)"
-            $mt4Installed = $true
+            winget source update | Out-Null
+            winget install --id MetaQuotes.MetaTrader5 -e --accept-source-agreements --accept-package-agreements
+            Write-Host "MT5 winget install finished."
           } catch {
-            Write-Warning "MT4 silent install flags not supported. Will start installer interactively in RDP."
+            Write-Warning "MT5 winget install failed: $($_.Exception.Message)"
           }
 
-          if (-not $mt4Installed) {
-            # Start interactive installer so you can finish it via RDP
-            Start-Process -FilePath $mt4Exe
-            Write-Warning "MT4 installer started. Finish installation inside RDP, then re-run workflow if needed."
-          }
-
-          # ---- Find MT5 terminal64.exe (robust search) ----
+          # Find MT5 terminal64.exe
           $mt5Candidates = @(
-            $mt5Dir,
             "C:\Program Files\MetaTrader 5",
             "C:\Program Files (x86)\MetaTrader 5",
             "$env:LOCALAPPDATA\Programs\MetaTrader 5",
@@ -126,13 +103,42 @@ jobs:
               if ($found) { $mt5Term = $found; break }
             }
           }
-          if (-not $mt5Term) { Write-Error "MT5 terminal64.exe not found after install"; exit 1 }
-          echo "MT5_TERMINAL=$($mt5Term.FullName)" >> $env:GITHUB_ENV
-          Write-Host "MT5 terminal: $($mt5Term.FullName)"
 
-          # ---- Find MT4 terminal.exe (robust search) ----
+          if (-not $mt5Term) {
+            Write-Host "MT5 not found via winget. Will download installer and start interactive mode in RDP."
+
+            $mt5Url = "https://download.mql5.com/cdn/web/metaquotes.ltd/mt5/mt5setup.exe"
+            $mt5Exe = Join-Path $dl "mt5setup.exe"
+            Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Exe -UseBasicParsing
+
+            Start-Process -FilePath $mt5Exe
+            Write-Warning "MT5 installer started interactively. Finish it inside RDP."
+          } else {
+            echo "MT5_TERMINAL=$($mt5Term.FullName)" >> $env:GITHUB_ENV
+            Write-Host "MT5 terminal: $($mt5Term.FullName)"
+          }
+
+          # -------------------------
+          # MT4 from repo (mt4setup.exe) with timeout
+          # -------------------------
+          $mt4Exe = Join-Path $dl "mt4setup.exe"
+          Copy-Item ".\mt4setup.exe" $mt4Exe -Force
+          Write-Host "Installing MT4 from repo (mt4setup.exe)..."
+
+          $p4 = Start-Process -FilePath $mt4Exe -ArgumentList "/silent","/verysilent","/sp-","/suppressmsgboxes" -PassThru
+          $timeoutSec = 180  # 3 minutes
+          if (-not $p4.WaitForExit($timeoutSec * 1000)) {
+            Write-Warning "MT4 silent install timed out. Starting interactive installer for RDP..."
+            try { $p4.Kill() } catch {}
+            Start-Process -FilePath $mt4Exe
+            Write-Warning "MT4 installer started interactively. Finish it inside RDP."
+          } else {
+            Write-Host "MT4 exit code: $($p4.ExitCode)"
+          }
+
+          # Find MT4 terminal.exe
           $mt4Candidates = @(
-            $mt4Dir,
+            "C:\MT4",
             "C:\Program Files\MetaTrader 4",
             "C:\Program Files (x86)\MetaTrader 4",
             "$env:LOCALAPPDATA\Programs\MetaTrader 4",
@@ -153,7 +159,7 @@ jobs:
             echo "MT4_TERMINAL=$($mt4Term.FullName)" >> $env:GITHUB_ENV
             Write-Host "MT4 terminal: $($mt4Term.FullName)"
           } else {
-            Write-Warning "MT4 terminal.exe not found yet. If MT4 installer is open, finish it inside RDP."
+            Write-Warning "MT4 terminal not found yet. If installer is open, finish it inside RDP."
           }
 
       - name: Initialize MT4/MT5 in PORTABLE mode (creates MQL folders in install dir)
@@ -161,10 +167,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
 
-          if (Test-Path $env:MT5_TERMINAL) {
+          if ($env:MT5_TERMINAL -and (Test-Path $env:MT5_TERMINAL)) {
             Start-Process -FilePath $env:MT5_TERMINAL -ArgumentList "/portable" -WindowStyle Hidden
             Start-Sleep -Seconds 12
             Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          } else {
+            Write-Warning "Skipping MT5 portable init (MT5 terminal not detected)."
           }
 
           if ($env:MT4_TERMINAL -and (Test-Path $env:MT4_TERMINAL)) {
@@ -188,6 +196,7 @@ jobs:
             )
 
             New-Item -ItemType Directory -Force $TargetMqlDir | Out-Null
+
             $tmp = Join-Path $env:TEMP ("mql_" + [Guid]::NewGuid().ToString("N"))
             New-Item -ItemType Directory -Force $tmp | Out-Null
 
@@ -211,12 +220,16 @@ jobs:
             Get-ChildItem -Path $TargetMqlDir -Force | Select-Object Name
           }
 
-          # MT5 portable MQL folder
-          $mt5Root = Split-Path $env:MT5_TERMINAL -Parent
-          $mt5Mql  = Join-Path $mt5Root "MQL5"
-          Extract-MQLZip -ZipPath ".\MQL5.zip" -TargetMqlDir $mt5Mql -Label "MT5"
+          # MT5
+          if ($env:MT5_TERMINAL -and (Test-Path $env:MT5_TERMINAL)) {
+            $mt5Root = Split-Path $env:MT5_TERMINAL -Parent
+            $mt5Mql  = Join-Path $mt5Root "MQL5"
+            Extract-MQLZip -ZipPath ".\MQL5.zip" -TargetMqlDir $mt5Mql -Label "MT5"
+          } else {
+            Write-Warning "MT5 not detected, so MQL5.zip was not copied."
+          }
 
-          # MT4 portable MQL folder (only if MT4 is detected)
+          # MT4
           if ($env:MT4_TERMINAL -and (Test-Path $env:MT4_TERMINAL)) {
             $mt4Root = Split-Path $env:MT4_TERMINAL -Parent
             $mt4Mql  = Join-Path $mt4Root "MQL4"
