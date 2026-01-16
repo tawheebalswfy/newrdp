@@ -9,105 +9,229 @@ jobs:
     timeout-minutes: 3600
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Configure Core RDP Settings
+        shell: powershell
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+            -Name "fDenyTSConnections" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
+        shell: powershell
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          $ErrorActionPreference = "Stop"
+          $upper=[char[]](65..90); $lower=[char[]](97..122); $num=[char[]](48..57)
+          $spec=([char[]](33..47)+[char[]](58..64)+[char[]](91..96)+[char[]](123..126))
+
+          $pw = -join( @(
+            $upper | Get-Random -Count 4
+            $lower | Get-Random -Count 4
+            $num   | Get-Random -Count 4
+            $spec  | Get-Random -Count 4
+          ) | Sort-Object {Get-Random} )
+
+          $secure = ConvertTo-SecureString $pw -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires | Out-Null
+          } else {
+            Set-LocalUser -Name "RDP" -Password $secure
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$pw"  >> $env:GITHUB_ENV
+
+      - name: Verify required files exist in repo
+        shell: powershell
+        run: |
+          Write-Host "Repo root content:"
+          Get-ChildItem -Force
+
+          if (-not (Test-Path ".\MQL4.zip")) { Write-Error "MQL4.zip not found in repo root"; exit 1 }
+          if (-not (Test-Path ".\MQL5.zip")) { Write-Error "MQL5.zip not found in repo root"; exit 1 }
+          if (-not (Test-Path ".\MT4_Setup.exe")) { Write-Error "MT4_Setup.exe not found in repo root"; exit 1 }
+
+      - name: Install MT5 (from MetaQuotes) and MT4 (from attached installer)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # --- MT5 download ---
+          $mt5Url = "https://download.mql5.com/cdn/web/metaquotes.ltd/mt5/mt5setup.exe"
+          $dl = "C:\Installers"
+          New-Item -ItemType Directory -Force $dl | Out-Null
+          $mt5Exe = Join-Path $dl "mt5setup.exe"
+          Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Exe -UseBasicParsing
+
+          # --- Install directories ---
+          $mt4Dir = "C:\MT4"
+          $mt5Dir = "C:\MT5"
+          New-Item -ItemType Directory -Force $mt4Dir, $mt5Dir | Out-Null
+
+          # --- MT5 unattended ---
+          Write-Host "Installing MT5..."
+          Start-Process -FilePath $mt5Exe -ArgumentList "/auto","/path:`"$mt5Dir`"" -Wait
+
+          # --- MT4 from repo file ---
+          Write-Host "Installing MT4 from repo installer MT4_Setup.exe ..."
+          Copy-Item ".\MT4_Setup.exe" (Join-Path $dl "MT4_Setup.exe") -Force
+          $mt4Exe = Join-Path $dl "MT4_Setup.exe"
+
+          # Many MT4 broker installers don't support /auto reliably; run normally but silently if possible
+          try {
+            Start-Process -FilePath $mt4Exe -ArgumentList "/silent","/verysilent","/sp-","/suppressmsgboxes" -Wait
+          } catch {
+            Write-Warning "Silent flags not supported. Running interactive installer may be needed via RDP."
+            Start-Process -FilePath $mt4Exe
+          }
+
+          # --- Locate terminals robustly ---
+          $mt5Term = Get-ChildItem -Path $mt5Dir -Recurse -Filter "terminal64.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $mt5Term) { Write-Error "MT5 terminal64.exe not found under C:\MT5"; exit 1 }
+          echo "MT5_TERMINAL=$($mt5Term.FullName)" >> $env:GITHUB_ENV
+          Write-Host "MT5 terminal: $($mt5Term.FullName)"
+
+          # MT4 terminal can land in Program Files; search several places
+          $mt4Candidates = @(
+            $mt4Dir,
+            "C:\Program Files\",
+            "C:\Program Files (x86)\",
+            "$env:LOCALAPPDATA\Programs\",
+            "$env:APPDATA\MetaQuotes\Terminal"
+          )
+
+          $mt4Term = $null
+          foreach ($c in $mt4Candidates) {
+            if (Test-Path $c) {
+              $found = Get-ChildItem -Path $c -Recurse -Filter "terminal.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $mt4Term = $found; break }
+            }
+          }
+
+          if ($mt4Term) {
+            echo "MT4_TERMINAL=$($mt4Term.FullName)" >> $env:GITHUB_ENV
+            Write-Host "MT4 terminal: $($mt4Term.FullName)"
+          } else {
+            Write-Warning "MT4 terminal.exe not found yet. If installer popped up, finish it via RDP."
+          }
+
+      - name: Initialize MT4/MT5 in PORTABLE mode
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          if (Test-Path $env:MT5_TERMINAL) {
+            Start-Process -FilePath $env:MT5_TERMINAL -ArgumentList "/portable" -WindowStyle Hidden
+            Start-Sleep -Seconds 12
+            Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+          if ($env:MT4_TERMINAL -and (Test-Path $env:MT4_TERMINAL)) {
+            Start-Process -FilePath $env:MT4_TERMINAL -ArgumentList "/portable" -WindowStyle Hidden
+            Start-Sleep -Seconds 12
+            Get-Process terminal -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Extract and copy MQL4.zip & MQL5.zip to PORTABLE folders
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Extract-MQLZip {
+            param([string]$ZipPath,[string]$TargetMqlDir,[string]$Label)
+
+            New-Item -ItemType Directory -Force $TargetMqlDir | Out-Null
+            $tmp = Join-Path $env:TEMP ("mql_" + [Guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Force $tmp | Out-Null
+
+            Expand-Archive -Path $ZipPath -DestinationPath $tmp -Force
+
+            $mql4 = Join-Path $tmp "MQL4"
+            $mql5 = Join-Path $tmp "MQL5"
+
+            if (Test-Path $mql4) {
+              Copy-Item (Join-Path $mql4 "*") -Destination $TargetMqlDir -Recurse -Force
+            } elseif (Test-Path $mql5) {
+              Copy-Item (Join-Path $mql5 "*") -Destination $TargetMqlDir -Recurse -Force
+            } else {
+              Copy-Item (Join-Path $tmp "*") -Destination $TargetMqlDir -Recurse -Force
+            }
+
+            Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "[$Label] Copied to $TargetMqlDir"
+          }
+
+          # MT5
+          $mt5Root = Split-Path $env:MT5_TERMINAL -Parent
+          $mt5Mql  = Join-Path $mt5Root "MQL5"
+          Extract-MQLZip -ZipPath ".\MQL5.zip" -TargetMqlDir $mt5Mql -Label "MT5"
+
+          # MT4 (only if found)
+          if ($env:MT4_TERMINAL -and (Test-Path $env:MT4_TERMINAL)) {
+            $mt4Root = Split-Path $env:MT4_TERMINAL -Parent
+            $mt4Mql  = Join-Path $mt4Root "MQL4"
+            Extract-MQLZip -ZipPath ".\MQL4.zip" -TargetMqlDir $mt4Mql -Label "MT4"
+          } else {
+            Write-Warning "MT4 terminal not detected yet, so MQL4.zip was not copied."
           }
 
       - name: Install Tailscale
+        shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $msi -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
+          Remove-Item $msi -Force
 
       - name: Establish Tailscale Connection
+        shell: powershell
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
+          $ErrorActionPreference = "Stop"
+          if (-not "${{ secrets.TAILSCALE_AUTH_KEY }}") { Write-Error "Missing TAILSCALE_AUTH_KEY secret"; exit 1 }
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+
+          $ip=$null; $i=0
+          while (-not $ip -and $i -lt 30) {
+            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 2
+            $i++
           }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
+          if (-not $ip) { Write-Error "No Tailscale IP"; exit 1 }
+
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $ip"
+
       - name: Verify RDP Accessibility
+        shell: powershell
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          $ErrorActionPreference = "Stop"
+          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $r.TcpTestSucceeded) { Write-Error "RDP port test failed"; exit 1 }
+          Write-Host "RDP port OK."
 
       - name: Maintain Connection
+        shell: powershell
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
           Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
+
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+            Write-Host "[$(Get-Date)] RDP Active"
+            Start-Sleep -Seconds 300
           }
